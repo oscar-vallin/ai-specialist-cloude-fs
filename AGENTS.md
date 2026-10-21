@@ -6,7 +6,7 @@ This file provides guidance to agents when working with code in this repository.
 Backend of an online bookstore e-commerce platform (browse, cart, checkout, pay, ship, cancel/return), built with IBM Bob. A React + Carbon UI consumes the REST API and is secondary. Functional domains and flow are in [`docs/architecture.png`](docs/architecture.png): Member, Store, Catalog, Order, Payment, Shipping.
 
 ## State of the repo
-- Only agent configuration, [`requirements.md`](requirements.md) and [`docs/architecture.png`](docs/architecture.png) exist. No application code, `pom.xml` or git repo yet. `requirements.md` is the source of truth: do not edit it unless asked. Items tagged **[ASSUMPTION]** are binding.
+- `backend/` holds the Spring Boot 3.5 skeleton (no business endpoints yet), the Flyway `V1__initial_schema.sql` built from [`docs/data-model.md`](docs/data-model.md) and the `Containerfile`. `api/openapi.yaml` and `frontend/` do not exist yet. `requirements.md` is the source of truth: do not edit it unless asked. Items tagged **[ASSUMPTION]** are binding.
 - Everything (code, comments, identifiers, API docs, commits, seed data, docs) MUST be in English.
 
 ## Agent configuration map
@@ -29,11 +29,14 @@ Backend of an online bookstore e-commerce platform (browse, cart, checkout, pay,
 ## Target layout (monorepo)
 `backend/` (Spring Boot), `frontend/` (React + `@carbon/react` only, no custom design system), `api/openapi.yaml`, `docs/` (`data-model.md`), `compose.yaml`, `.env.example`. Each `Containerfile` lives in its own service folder (not the root).
 
-## Commands (planned, from requirements.md; none verified yet)
-- Container tool is **Podman**, not Docker: `podman compose up --build`. Never generate Docker-specific files (`Dockerfile`, `docker-compose.yml`); use `Containerfile` and `compose.yaml`.
-- Backend (run from `backend/`): `./mvnw clean install` (always the wrapper), `./mvnw spring-boot:run`.
-- Single test: `./mvnw test -Dtest=ClassName#methodName` (integration tests via Testcontainers need the Podman socket configured; document it in the README).
-- Health: `/actuator/health`. No H2 anywhere; tests use Testcontainers PostgreSQL.
+## Commands (verified on macOS with Podman 5.8)
+- Container tool is **Podman**, not Docker: `cp .env.example .env && podman compose up --build`. Never generate Docker-specific files (`Dockerfile`, `docker-compose.yml`); use `Containerfile` and `compose.yaml`.
+- If host port 8080 is taken, set `BACKEND_PORT` in `.env` (for example `8081`); the container always listens on 8080.
+- Backend (run from `backend/`): `./mvnw clean package` (always the wrapper; runs the tests), `./mvnw spring-boot:run` (needs a PostgreSQL and `SPRING_DATASOURCE_PASSWORD`).
+- Tests need Testcontainers to reach Podman. On macOS: `export DOCKER_HOST=unix://$(podman machine inspect --format '{{.ConnectionInfo.PodmanSocket.Path}}') TESTCONTAINERS_RYUK_DISABLED=true`.
+- Single test: `./mvnw test -Dtest=ClassName#methodName`.
+- Health: `/actuator/health` (public). Unauthenticated calls to any other path return 401. No H2 anywhere; tests use Testcontainers PostgreSQL.
+- Spring Boot is pinned to 3.5.x because springdoc 3.x and start.spring.io target Spring Boot 4. Keep springdoc on 2.8.x.
 
 ## Stack and package rules
 - Java 21, Spring Boot 3.x, PostgreSQL, Flyway, MapStruct, springdoc, Spring Security + JWT.

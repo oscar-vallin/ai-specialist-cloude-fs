@@ -1,0 +1,25 @@
+# DBHub configuration for the local development database (see compose.yaml).
+# No secrets live here: ${VAR} references are resolved from the environment at start-up
+# (the launcher in .bob/mcp.json loads them from the git-ignored .env).
+
+[[sources]]
+id = "bookstore"
+type = "postgres"
+host = "localhost"
+port = "${POSTGRES_PORT}"
+database = "${POSTGRES_DB}"
+user = "${POSTGRES_USER}"
+password = "${POSTGRES_PASSWORD}"
+sslmode = "disable"
+
+# Read-only guard: only SELECT / WITH / EXPLAIN / SHOW are accepted; anything else,
+# including multi-statement payloads, is rejected before it reaches PostgreSQL.
+[[tools]]
+name = "execute_sql"
+source = "bookstore"
+readonly = true
+max_rows = 500
+
+[[tools]]
+name = "search_objects"
+source = "bookstore"

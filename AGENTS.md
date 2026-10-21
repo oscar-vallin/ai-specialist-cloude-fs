@@ -13,7 +13,7 @@ Backend of an online bookstore e-commerce platform (browse, cart, checkout, pay,
 - [`.bob/rules/`](.bob/rules): one short file per topic (`java-style`, `testing`, `security-and-payments`, `api-and-openapi`, `git-workflow`). Read the relevant one before working on that topic.
 - [`.bob/skills/`](.bob/skills): `openapi-first`, `new-endpoint`, `db-migration`, `seed-data`, `checkout-flow`. Use the matching skill instead of improvising the workflow.
 - [`.bob/custom_modes.yaml`](.bob/custom_modes.yaml): `bookstore-backend-dev` (read, edit, execute, mcp) and `bookstore-code-review` (read only).
-- [`.bob/mcp.json`](.bob/mcp.json): empty template; never put credentials in it. [`.bobignore`](.bobignore) excludes build outputs, dependencies, `.env` and IDE files.
+- [`.bob/mcp.json`](.bob/mcp.json): read-only PostgreSQL MCP server `bookstore-postgres-readonly` (DBHub, config in [`.bob/dbhub.toml`](.bob/dbhub.toml)). It reads credentials from the git-ignored `.env` at launch and needs `podman compose up -d postgres` first. Never put credentials in either file. [`.bobignore`](.bobignore) excludes build outputs, dependencies, `.env` and IDE files.
 - `.bob/rules-agent|ask|plan/AGENTS.md`: mode-specific non-obvious notes.
 
 ## Non-negotiable rules

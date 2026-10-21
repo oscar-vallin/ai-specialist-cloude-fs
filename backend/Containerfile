@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1
+# ---- Build stage: JDK + Maven wrapper ----
+FROM docker.io/library/eclipse-temurin:21-jdk AS build
+WORKDIR /workspace
+
+# Resolve dependencies first so this layer is cached until pom.xml changes.
+COPY .mvn/ .mvn/
+COPY mvnw pom.xml ./
+RUN chmod +x mvnw && ./mvnw -B -q dependency:go-offline
+
+COPY src/ src/
+RUN ./mvnw -B -q clean package -DskipTests \
+    && mkdir -p target/extracted \
+    && java -Djarmode=layertools -jar target/*.jar extract --destination target/extracted
+
+# ---- Runtime stage: JRE only, non-root user ----
+FROM docker.io/library/eclipse-temurin:21-jre AS runtime
+WORKDIR /app
+
+RUN groupadd --system --gid 10001 bookstore \
+    && useradd --system --uid 10001 --gid bookstore --no-create-home --shell /usr/sbin/nologin bookstore
+
+COPY --from=build --chown=bookstore:bookstore /workspace/target/extracted/dependencies/ ./
+COPY --from=build --chown=bookstore:bookstore /workspace/target/extracted/spring-boot-loader/ ./
+COPY --from=build --chown=bookstore:bookstore /workspace/target/extracted/snapshot-dependencies/ ./
+COPY --from=build --chown=bookstore:bookstore /workspace/target/extracted/application/ ./
+
+USER bookstore
+EXPOSE 8080
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75"
+ENTRYPOINT ["java", "org.springframework.boot.loader.launch.JarLauncher"]

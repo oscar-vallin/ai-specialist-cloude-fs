@@ -1,0 +1,2185 @@
+openapi: 3.0.3
+info:
+  title: Bookstore API
+  version: 1.0.0
+  description: |
+    Contract for the Member, Catalog, Cart and Order domains of the online bookstore backend.
+
+    This file is the source of truth (contract-first): code must match it, and it is reviewed before any
+    endpoint is implemented. Cross-cutting conventions (camelCase JSON, money as string, pagination, error
+    format, status codes) are recorded in `docs/api-conventions.md`.
+
+    **Out of this contract** (separate iterations): Payment endpoints, Shipping endpoints, Store administration
+    and Admin CRUD of catalog data. Order confirmation (`PENDING_PAYMENT -> CONFIRMED`) and shipment progress
+    (`CONFIRMED -> SHIPPED -> DELIVERED`) are driven by the Payment and Shipping domains through service
+    interfaces; they cannot be triggered through this API.
+
+    **Roles.** Each operation lists the roles allowed to call it in `x-required-role` (any of them).
+    `GUEST` means an unauthenticated caller. A registered user has the role `CUSTOMER` or `ADMIN`; the role
+    `GUEST` is never assigned to an account.
+
+    **Catalog visibility (entitlements).** A product is visible to the caller only if it is listed in at least one
+    `ACTIVE` catalog of the selected store that the caller is entitled to. A catalog without entitlement rows is
+    visible to everyone including guests; otherwise only to the listed roles. `ADMIN` sees every catalog. Products
+    that are not visible behave as if they did not exist (404 on detail, absent from lists).
+
+    **Store selection.** Catalog and cart operations work on one store. When `storeId` is omitted, the server uses
+    its configured default store (seed: "Main Store").
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Local development (the host port is `BACKEND_PORT` in `.env`; the container always listens on 8080)
+tags:
+  - name: Auth
+    description: Registration, login (JWT) and logout.
+  - name: Users
+    description: Current user, delivery addresses, wallet and gift points.
+  - name: Catalog
+    description: Categories, brands and products. Read-only.
+  - name: Cart
+    description: Shopping cart for guests and registered users.
+  - name: Orders
+    description: Checkout, order placement, history, cancellation, return and buy again.
+
+paths:
+  /auth/register:
+    post:
+      tags: [Auth]
+      operationId: register
+      summary: Register a customer account
+      description: |
+        Creates a user with the role `CUSTOMER`. The password is stored as a BCrypt hash. Registration does not log
+        the user in; call `POST /auth/login` afterwards. Administrators cannot be created through this endpoint.
+
+        Error codes: `VALIDATION_FAILED` (400), `EMAIL_ALREADY_REGISTERED` (409; compared case-insensitively).
+      x-required-role: [GUEST]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: Account created.
+          headers:
+            Location:
+              description: URL of the created user (`/users/me` once authenticated).
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Log in and obtain a JWT
+      description: |
+        Returns a bearer token. If the request carries a valid `X-Guest-Token` for an `ACTIVE` guest cart, that cart
+        is merged into the user's active cart in the same transaction (FR-O1): quantities of the same product are
+        added (capped at the available stock), the guest cart becomes `MERGED` and `guestCartMerged` is `true`.
+        An unknown or already merged guest token is ignored silently.
+
+        The same error is returned for an unknown e-mail and a wrong password so accounts cannot be enumerated.
+
+        Error codes: `VALIDATION_FAILED` (400), `INVALID_CREDENTIALS` (401), `ACCOUNT_DISABLED` (403).
+      x-required-role: [GUEST]
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/GuestToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Authenticated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Log out (revoke the current token)
+      description: |
+        Revokes the presented JWT (deny-list until the token's own expiry). The token is rejected afterwards with
+        `UNAUTHENTICATED`.
+      x-required-role: [CUSTOMER, ADMIN]
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Token revoked.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /users/me:
+    get:
+      tags: [Users]
+      operationId: getCurrentUser
+      summary: Get the current user
+      description: Returns the authenticated user's profile and roles.
+      x-required-role: [CUSTOMER, ADMIN]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The current user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /users/me/addresses:
+    get:
+      tags: [Users]
+      operationId: listAddresses
+      summary: List my delivery addresses
+      description: The default address (if any) comes first, then the rest by creation date.
+      x-required-role: [CUSTOMER, ADMIN]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The user's addresses.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Address'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Users]
+      operationId: createAddress
+      summary: Add a delivery address
+      description: |
+        The first address of a user becomes the default automatically. When `isDefault` is `true`, the previous
+        default is unset in the same transaction.
+
+        Error codes: `VALIDATION_FAILED` (400).
+      x-required-role: [CUSTOMER, ADMIN]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddressRequest'
+      responses:
+        '201':
+          description: Address created.
+          headers:
+            Location:
+              description: URL of the new address.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Address'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /users/me/addresses/{addressId}:
+    parameters:
+      - $ref: '#/components/parameters/AddressId'
+    get:
+      tags: [Users]
+      operationId: getAddress
+      summary: Get one of my addresses
+      description: |
+        Another user's address is reported as not found.
+
+        Error codes: `ADDRESS_NOT_FOUND` (404).
+      x-required-role: [CUSTOMER, ADMIN]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The address.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Address'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Users]
+      operationId: updateAddress
+      summary: Replace one of my addresses
+      description: |
+        Full replacement. Past orders keep their own address snapshot, so editing never changes an order.
+
+        Error codes: `VALIDATION_FAILED` (400), `ADDRESS_NOT_FOUND` (404).
+      x-required-role: [CUSTOMER, ADMIN]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddressRequest'
+      responses:
+        '200':
+          description: The updated address.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Address'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Users]
+      operationId: deleteAddress
+      summary: Delete one of my addresses
+      description: |
+        Hard delete; orders are unaffected because they store a snapshot. Deleting the default address leaves the
+        user without a default.
+
+        Error codes: `ADDRESS_NOT_FOUND` (404).
+      x-required-role: [CUSTOMER, ADMIN]
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Address deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /users/me/addresses/{addressId}/default:
+    parameters:
+      - $ref: '#/components/parameters/AddressId'
+    post:
+      tags: [Users]
+      operationId: setDefaultAddress
+      summary: Make an address my default
+      description: |
+        Idempotent. The previous default is unset in the same transaction.
+
+        Error codes: `ADDRESS_NOT_FOUND` (404).
+      x-required-role: [CUSTOMER, ADMIN]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The address, now the default.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Address'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /users/me/wallet:
+    get:
+      tags: [Users]
+      operationId: getWallet
+      summary: Get my wallet balance
+      description: Read-only (FR-M4). Top-ups are out of scope for this contract.
+      x-required-role: [CUSTOMER, ADMIN]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The wallet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wallet'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /users/me/gift-points:
+    get:
+      tags: [Users]
+      operationId: getGiftPoints
+      summary: Get my gift point balance
+      description: |
+        Read-only (FR-M4). The balance is the balance of record of the user's gift point account; the conversion
+        rate comes from the store policy (default 100 points = 1 USD).
+      x-required-role: [CUSTOMER, ADMIN]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The gift point account.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GiftPoints'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /categories:
+    get:
+      tags: [Catalog]
+      operationId: listCategories
+      summary: List categories
+      description: |
+        Returns categories ordered by `displayOrder`, then `name`. Without `parentId` the whole tree is returned
+        flat (use `parentId` on each item to rebuild it). With `parentId`, only its direct children are returned.
+
+        Error codes: `VALIDATION_FAILED` (400).
+      x-required-role: [GUEST, CUSTOMER, ADMIN]
+      security:
+        - {}
+        - bearerAuth: []
+      parameters:
+        - name: parentId
+          in: query
+          description: Return only the direct children of this category.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: The categories.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Category'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /brands:
+    get:
+      tags: [Catalog]
+      operationId: listBrands
+      summary: List brands (publishers)
+      description: |
+        Ordered by name. With `categoryId`, only brands that have at least one visible product in that category or
+        its sub-categories are returned (FR-C2).
+
+        Error codes: `VALIDATION_FAILED` (400), `STORE_NOT_FOUND` (404).
+      x-required-role: [GUEST, CUSTOMER, ADMIN]
+      security:
+        - {}
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/StoreId'
+        - name: categoryId
+          in: query
+          description: Only brands with visible products in this category (including its sub-categories).
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: A page of brands.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BrandPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /products:
+    get:
+      tags: [Catalog]
+      operationId: listProducts
+      summary: List and search products
+      description: |
+        Only `ACTIVE` products visible to the caller (see catalog visibility) are returned. All filters are combined
+        with AND. `categoryId` includes the sub-categories of that category.
+
+        `sort` is `<field>,<direction>` with field `title`, `price` or `publicationDate` and direction `asc` or
+        `desc`. Default: `title,asc`. A tie is always broken by `id` so pages are stable.
+
+        Validation: `minPrice` must not exceed `maxPrice`; `q` has 2 to 100 characters.
+
+        Error codes: `VALIDATION_FAILED` (400), `STORE_NOT_FOUND` (404).
+      x-required-role: [GUEST, CUSTOMER, ADMIN]
+      security:
+        - {}
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/StoreId'
+        - name: q
+          in: query
+          description: Case-insensitive text search over title, tagline and author name.
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 100
+        - name: categoryId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: brandId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: authorId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: language
+          in: query
+          description: ISO 639-1 code, lower case.
+          schema:
+            type: string
+            pattern: '^[a-z]{2}$'
+            example: en
+        - name: format
+          in: query
+          schema:
+            $ref: '#/components/schemas/ProductFormat'
+        - name: minPrice
+          in: query
+          schema:
+            $ref: '#/components/schemas/Money'
+        - name: maxPrice
+          in: query
+          schema:
+            $ref: '#/components/schemas/Money'
+        - name: inStock
+          in: query
+          description: When `true`, only products with stock available (e-books always count as available).
+          schema:
+            type: boolean
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - name: sort
+          in: query
+          schema:
+            type: string
+            pattern: '^(title|price|publicationDate)(,(asc|desc))?$'
+            default: title,asc
+            example: price,desc
+      responses:
+        '200':
+          description: A page of products.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /products/recommended:
+    get:
+      tags: [Catalog]
+      operationId: listRecommendedProducts
+      summary: Recommended products for me
+      description: |
+        Based on the categories and authors of the caller's order history (FR-C6). Books already purchased are
+        excluded. A customer without order history receives the current bestsellers instead. The literal path
+        `/products/recommended` takes precedence over `/products/{productId}`.
+
+        Error codes: `VALIDATION_FAILED` (400), `UNAUTHENTICATED` (401).
+      x-required-role: [CUSTOMER, ADMIN]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/StoreId'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Up to `limit` visible products, best match first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProductSummary'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /products/{productId}:
+    parameters:
+      - $ref: '#/components/parameters/ProductId'
+    get:
+      tags: [Catalog]
+      operationId: getProduct
+      summary: Get product detail
+      description: |
+        Includes the tentative delivery date (FR-C4/FR-SH2). The destination is, in order: the `country` parameter;
+        the country of the caller's default address; the store's default country. The date is today plus the
+        estimated days of the matching shipping rate for the product weight; it is `null` when no rate applies
+        (always `null` for e-books, which are not shipped).
+
+        Error codes: `VALIDATION_FAILED` (400), `PRODUCT_NOT_FOUND` (404; also when the product is not visible to
+        the caller or is archived), `STORE_NOT_FOUND` (404).
+      x-required-role: [GUEST, CUSTOMER, ADMIN]
+      security:
+        - {}
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/StoreId'
+        - name: country
+          in: query
+          description: Destination country for the delivery estimate (ISO 3166-1 alpha-2, upper case).
+          schema:
+            type: string
+            pattern: '^[A-Z]{2}$'
+            example: US
+      responses:
+        '200':
+          description: The product.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /products/{productId}/related:
+    parameters:
+      - $ref: '#/components/parameters/ProductId'
+    get:
+      tags: [Catalog]
+      operationId: listRelatedProducts
+      summary: Related products (related, up-sell, cross-sell)
+      description: |
+        Curated relations first, ordered by `position`. If there are fewer than `limit`, the list is completed with
+        products of the same primary category or author. Only visible, `ACTIVE` products are returned and the
+        product itself never appears.
+
+        Error codes: `VALIDATION_FAILED` (400), `PRODUCT_NOT_FOUND` (404), `STORE_NOT_FOUND` (404).
+      x-required-role: [GUEST, CUSTOMER, ADMIN]
+      security:
+        - {}
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/StoreId'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Related products.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RelatedProduct'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /cart:
+    get:
+      tags: [Cart]
+      operationId: getCart
+      summary: Get my cart
+      description: |
+        Identifies the cart by the bearer token (registered user) or by `X-Guest-Token` (guest). If both are sent the
+        bearer token wins and the guest token is ignored; carts are only merged at login. A registered user always
+        has an active cart (created on first access). Prices are the current catalog prices; the cart stores none.
+
+        Error codes: `CART_NOT_FOUND` (404; a guest without a valid token), `STORE_NOT_FOUND` (404).
+      x-required-role: [GUEST, CUSTOMER, ADMIN]
+      security:
+        - {}
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/GuestToken'
+        - $ref: '#/components/parameters/StoreId'
+      responses:
+        '200':
+          description: The active cart.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cart'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /cart/items:
+    post:
+      tags: [Cart]
+      operationId: addCartItem
+      summary: Add a product to the cart
+      description: |
+        If the product is already in the cart, the quantities are added. A guest without a token gets a new guest
+        cart; its token is returned in the `X-Guest-Token` response header and in `Cart.guestToken`, and must be sent
+        on later requests.
+
+        Error codes: `VALIDATION_FAILED` (400), `PRODUCT_NOT_FOUND` (404; unknown, archived or not visible),
+        `INSUFFICIENT_STOCK` (409; the resulting quantity exceeds the stock of a physical book),
+        `STORE_NOT_FOUND` (404).
+      x-required-role: [GUEST, CUSTOMER, ADMIN]
+      security:
+        - {}
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/GuestToken'
+        - $ref: '#/components/parameters/StoreId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddCartItemRequest'
+      responses:
+        '201':
+          description: The updated cart.
+          headers:
+            X-Guest-Token:
+              description: Present only when a new guest cart was created.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cart'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /cart/items/{itemId}:
+    parameters:
+      - $ref: '#/components/parameters/CartItemId'
+      - $ref: '#/components/parameters/GuestToken'
+    put:
+      tags: [Cart]
+      operationId: updateCartItem
+      summary: Set the quantity of a cart item
+      description: |
+        Sets (does not add to) the quantity.
+
+        Error codes: `VALIDATION_FAILED` (400), `CART_NOT_FOUND` (404), `CART_ITEM_NOT_FOUND` (404; also for items
+        of another cart), `INSUFFICIENT_STOCK` (409).
+      x-required-role: [GUEST, CUSTOMER, ADMIN]
+      security:
+        - {}
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateCartItemRequest'
+      responses:
+        '200':
+          description: The updated cart.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cart'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    delete:
+      tags: [Cart]
+      operationId: removeCartItem
+      summary: Remove an item from the cart
+      description: |
+        Error codes: `CART_NOT_FOUND` (404), `CART_ITEM_NOT_FOUND` (404).
+      x-required-role: [GUEST, CUSTOMER, ADMIN]
+      security:
+        - {}
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Item removed.
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /cart/coupon:
+    put:
+      tags: [Cart]
+      operationId: applyCoupon
+      summary: Apply a coupon to the cart
+      description: |
+        Replaces any coupon already applied. The code is validated now (exists, active, inside its validity period,
+        valid for the store) and validated again at checkout, where the minimum order amount and redemption limits
+        are enforced too.
+
+        Error codes: `VALIDATION_FAILED` (400), `CART_NOT_FOUND` (404), `COUPON_INVALID` (422).
+      x-required-role: [GUEST, CUSTOMER, ADMIN]
+      security:
+        - {}
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/GuestToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApplyCouponRequest'
+      responses:
+        '200':
+          description: The cart with the coupon applied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cart'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+    delete:
+      tags: [Cart]
+      operationId: removeCoupon
+      summary: Remove the coupon from the cart
+      description: |
+        Idempotent.
+
+        Error codes: `CART_NOT_FOUND` (404).
+      x-required-role: [GUEST, CUSTOMER, ADMIN]
+      security:
+        - {}
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/GuestToken'
+      responses:
+        '204':
+          description: Coupon removed (or none was applied).
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /orders/checkout:
+    post:
+      tags: [Orders]
+      operationId: checkoutQuote
+      summary: Review checkout totals (no side effects)
+      description: |
+        Computes the order that would be placed from the caller's active cart and the chosen address, without
+        creating anything or reserving stock. Prices, tax (store policy tax rate on the discounted subtotal;
+        shipping is not taxed), shipping (shipping rate for the address country and total weight; free above the
+        store's free-shipping threshold) and the coupon discount are all computed on the server.
+
+        `couponCode`, when present, is used instead of the coupon applied to the cart, for this quote only.
+
+        Guests cannot check out: they receive `UNAUTHENTICATED` (401) and must log in first; the guest cart is
+        merged at login.
+
+        Error codes: `VALIDATION_FAILED` (400), `UNAUTHENTICATED` (401), `ADDRESS_NOT_FOUND` (404),
+        `CART_EMPTY` (422), `PRODUCT_UNAVAILABLE` (422), `COUPON_INVALID` (422), `SHIPPING_UNAVAILABLE` (422),
+        `INSUFFICIENT_STOCK` (409).
+      x-required-role: [CUSTOMER]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckoutRequest'
+      responses:
+        '200':
+          description: The computed totals.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckoutQuote'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /orders:
+    get:
+      tags: [Orders]
+      operationId: listOrders
+      summary: My order history
+      description: |
+        Only the caller's own orders, newest first by default. `sort` is `placedAt,asc` or `placedAt,desc`.
+
+        Error codes: `VALIDATION_FAILED` (400).
+      x-required-role: [CUSTOMER]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          description: Only orders in this status.
+          schema:
+            $ref: '#/components/schemas/OrderStatus'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - name: sort
+          in: query
+          schema:
+            type: string
+            pattern: '^placedAt(,(asc|desc))?$'
+            default: placedAt,desc
+      responses:
+        '200':
+          description: A page of orders.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderSummaryPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Orders]
+      operationId: placeOrder
+      summary: Place an order from my cart
+      description: |
+        Re-runs every check of `POST /orders/checkout`, then creates the order in status `PENDING_PAYMENT`, copies
+        the address and the item prices into the order (snapshots), reserves the stock and records the coupon
+        redemption. The cart stays `ACTIVE` until the order is confirmed, so a failed payment can be retried with a
+        new order. An order that is not paid before `paymentExpiresAt` becomes `PAYMENT_FAILED` and its stock is
+        released.
+
+        **Server-side price validation.** The client never sends prices. `expectedTotal` is only a staleness guard:
+        if present and different from the total the server computes now, nothing is created and `PRICE_CHANGED`
+        (409) is returned with the new total in the problem details. It is never used to compute an amount.
+
+        **Idempotency.** `Idempotency-Key` is required and scoped to the user. Replaying a key with the same body
+        returns the original order with `200` and the header `Idempotent-Replayed: true`. Reusing it with a different
+        body returns `IDEMPOTENCY_KEY_REUSED` (409).
+
+        Error codes: `IDEMPOTENCY_KEY_REQUIRED` (400), `VALIDATION_FAILED` (400), `UNAUTHENTICATED` (401),
+        `ADDRESS_NOT_FOUND` (404), `PRICE_CHANGED` (409), `INSUFFICIENT_STOCK` (409),
+        `IDEMPOTENCY_KEY_REUSED` (409), `CART_EMPTY` (422), `PRODUCT_UNAVAILABLE` (422), `COUPON_INVALID` (422),
+        `SHIPPING_UNAVAILABLE` (422).
+      x-required-role: [CUSTOMER]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlaceOrderRequest'
+      responses:
+        '201':
+          description: Order created in status `PENDING_PAYMENT`.
+          headers:
+            Location:
+              description: URL of the order.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '200':
+          description: Idempotent replay; the original order.
+          headers:
+            Idempotent-Replayed:
+              description: Always `true`.
+              schema:
+                type: string
+                enum: ['true']
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /orders/{orderId}:
+    parameters:
+      - $ref: '#/components/parameters/OrderId'
+    get:
+      tags: [Orders]
+      operationId: getOrder
+      summary: Get one of my orders
+      description: |
+        Another user's order is reported as not found.
+
+        Error codes: `ORDER_NOT_FOUND` (404).
+      x-required-role: [CUSTOMER]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The order.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /orders/{orderId}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/OrderId'
+    post:
+      tags: [Orders]
+      operationId: cancelOrder
+      summary: Cancel an order within the cancellation window
+      description: |
+        Allowed only for an order in status `CONFIRMED` and only while `now <= cancelDeadlineAt`, where the deadline
+        was frozen at confirmation as `confirmedAt + cancellation window` of the store policy (default 48 hours).
+        The check uses the server clock. On success the status becomes `CANCELLED`, reserved/sold stock is returned
+        and every captured payment is refunded to its original method (gift points and wallet are credited back).
+
+        - Cancelling at 47 hours succeeds.
+        - Cancelling after the window is rejected with **422** `CANCELLATION_WINDOW_EXPIRED`; nothing changes.
+        - An order that is not `CONFIRMED` (still unpaid, shipped, already cancelled...) is rejected with **409**
+          `ORDER_INVALID_STATE`. Orders already `SHIPPED` cannot be cancelled; use the return flow after delivery.
+
+        Error codes: `VALIDATION_FAILED` (400), `ORDER_NOT_FOUND` (404), `ORDER_INVALID_STATE` (409),
+        `CONCURRENT_MODIFICATION` (409), `CANCELLATION_WINDOW_EXPIRED` (422).
+      x-required-role: [CUSTOMER]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelOrderRequest'
+      responses:
+        '200':
+          description: The cancelled order.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /orders/{orderId}/return:
+    parameters:
+      - $ref: '#/components/parameters/OrderId'
+    post:
+      tags: [Orders]
+      operationId: returnOrder
+      summary: Request a return of a delivered order
+      description: |
+        Allowed only for an order in status `DELIVERED` and only while `now <= returnDeadlineAt` (delivery time plus
+        the store policy return window, default 7 days). A return always covers the whole order. The order moves to
+        `RETURN_REQUESTED`; the return shipment and the refund are then handled by the Shipping and Payment domains
+        and the order ends as `RETURNED`.
+
+        Error codes: `VALIDATION_FAILED` (400), `ORDER_NOT_FOUND` (404), `ORDER_INVALID_STATE` (409),
+        `CONCURRENT_MODIFICATION` (409), `RETURN_WINDOW_EXPIRED` (422).
+      x-required-role: [CUSTOMER]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReturnOrderRequest'
+      responses:
+        '201':
+          description: Return requested; the order is `RETURN_REQUESTED`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /orders/{orderId}/buy-again:
+    parameters:
+      - $ref: '#/components/parameters/OrderId'
+    post:
+      tags: [Orders]
+      operationId: buyAgain
+      summary: Add the items of a past order to my cart
+      description: |
+        Re-adds every item of the order to the caller's active cart using the **current** price and stock, never the
+        price paid then (FR-O8). Per line: quantities are added to what is already in the cart; if stock is lower than
+        requested the quantity is reduced (`ADJUSTED`); if the product is archived, not visible or out of stock the line
+        is `SKIPPED` with a reason. `previousUnitPrice` and `currentUnitPrice` let the client show price changes.
+        Works for orders in any status.
+
+        Error codes: `ORDER_NOT_FOUND` (404).
+      x-required-role: [CUSTOMER]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Result per line and the updated cart.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BuyAgainResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT obtained from `POST /auth/login`. Sent as `Authorization Bearer <token>`.
+
+  parameters:
+    Page:
+      name: page
+      in: query
+      description: Zero-based page index.
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+    Size:
+      name: size
+      in: query
+      description: Page size.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    Limit:
+      name: limit
+      in: query
+      description: Maximum number of items to return.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 20
+        default: 10
+    StoreId:
+      name: storeId
+      in: query
+      description: Store to browse. Defaults to the server's default store.
+      schema:
+        type: string
+        format: uuid
+    GuestToken:
+      name: X-Guest-Token
+      in: header
+      description: |
+        Opaque token identifying a guest cart, returned when the guest cart was created. Ignored when a valid bearer
+        token is sent (except at login, where it triggers the merge).
+      schema:
+        type: string
+        minLength: 22
+        maxLength: 64
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated unique key (a UUID is recommended). Scoped to the authenticated user.
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 100
+    AddressId:
+      name: addressId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ProductId:
+      name: productId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    CartItemId:
+      name: itemId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    OrderId:
+      name: orderId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    BadRequest:
+      description: Malformed JSON or invalid input (`VALIDATION_FAILED`, `MALFORMED_REQUEST`, `IDEMPOTENCY_KEY_REQUIRED`). Field errors are listed in `errors`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: Missing, invalid, expired or revoked token, or wrong credentials (`UNAUTHENTICATED`, `INVALID_CREDENTIALS`).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: Authenticated but not allowed (`FORBIDDEN`, `ACCOUNT_DISABLED`).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: The resource does not exist or belongs to someone else (`*_NOT_FOUND`).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: The request conflicts with the current state (`EMAIL_ALREADY_REGISTERED`, `INSUFFICIENT_STOCK`, `PRICE_CHANGED`, `IDEMPOTENCY_KEY_REUSED`, `ORDER_INVALID_STATE`, `CONCURRENT_MODIFICATION`).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnprocessableEntity:
+      description: Well formed but violates a business rule (`CART_EMPTY`, `COUPON_INVALID`, `PRODUCT_UNAVAILABLE`, `SHIPPING_UNAVAILABLE`, `CANCELLATION_WINDOW_EXPIRED`, `RETURN_WINDOW_EXPIRED`).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Money:
+      type: string
+      pattern: '^\d{1,10}\.\d{2}$'
+      description: Decimal amount in the store currency with exactly two decimals. Never a JSON number.
+      example: '12.50'
+
+    Role:
+      type: string
+      enum: [GUEST, CUSTOMER, ADMIN]
+      description: '`GUEST` describes an unauthenticated caller and never appears on an account.'
+
+    ProductFormat:
+      type: string
+      enum: [PAPERBACK, HARDCOVER, EBOOK]
+
+    StockStatus:
+      type: string
+      enum: [IN_STOCK, OUT_OF_STOCK]
+      description: '`IN_STOCK` when available minus reserved quantity is above zero, or always for e-books.'
+
+    RelationType:
+      type: string
+      enum: [RELATED, UP_SELL, CROSS_SELL]
+
+    OrderStatus:
+      type: string
+      enum:
+        - PENDING_PAYMENT
+        - PAYMENT_FAILED
+        - CONFIRMED
+        - SHIPPED
+        - DELIVERED
+        - CANCELLED
+        - RETURN_REQUESTED
+        - RETURNED
+      description: |
+        Lifecycle (requirements 4.7): `PENDING_PAYMENT -> CONFIRMED -> SHIPPED -> DELIVERED`.
+        Alternatives: `PENDING_PAYMENT -> PAYMENT_FAILED`, `CONFIRMED -> CANCELLED` (inside the window),
+        `DELIVERED -> RETURN_REQUESTED -> RETURNED`. The `CART` state is the cart itself, not an order status.
+        `PAYMENT_FAILED`, `CANCELLED` and `RETURNED` are terminal.
+
+    PageMetadata:
+      type: object
+      required: [page, size, totalElements, totalPages]
+      properties:
+        page:
+          type: integer
+          minimum: 0
+        size:
+          type: integer
+          minimum: 1
+        totalElements:
+          type: integer
+          format: int64
+          minimum: 0
+        totalPages:
+          type: integer
+          minimum: 0
+
+    # ----- Member -----
+
+    RegisterRequest:
+      type: object
+      required: [email, password, firstName, lastName]
+      additionalProperties: false
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 255
+        password:
+          type: string
+          format: password
+          minLength: 8
+          maxLength: 72
+          description: 8 to 72 characters (72 is the BCrypt limit). Never logged or returned.
+        firstName:
+          type: string
+          minLength: 1
+          maxLength: 100
+        lastName:
+          type: string
+          minLength: 1
+          maxLength: 100
+        phoneCountryCode:
+          type: string
+          pattern: '^\+?[0-9]{1,6}$'
+          maxLength: 8
+          example: '+1'
+        phoneNumber:
+          type: string
+          pattern: '^[0-9 ()-]{4,32}$'
+          maxLength: 32
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      additionalProperties: false
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 255
+        password:
+          type: string
+          format: password
+          minLength: 1
+          maxLength: 72
+
+    LoginResponse:
+      type: object
+      required: [accessToken, tokenType, expiresIn, user, guestCartMerged]
+      properties:
+        accessToken:
+          type: string
+          description: Signed JWT.
+        tokenType:
+          type: string
+          enum: [Bearer]
+        expiresIn:
+          type: integer
+          description: Token lifetime in seconds.
+          example: 3600
+        user:
+          $ref: '#/components/schemas/User'
+        guestCartMerged:
+          type: boolean
+          description: '`true` when a guest cart was merged into the user cart by this login.'
+
+    User:
+      type: object
+      required: [id, email, firstName, lastName, status, roles]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        firstName:
+          type: string
+        lastName:
+          type: string
+        phoneCountryCode:
+          type: string
+          nullable: true
+        phoneNumber:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [ACTIVE, DISABLED]
+        roles:
+          type: array
+          items:
+            $ref: '#/components/schemas/Role'
+          description: '`CUSTOMER` and/or `ADMIN`.'
+
+    AddressRequest:
+      type: object
+      required: [firstName, lastName, line1, city, state, postalCode, country]
+      additionalProperties: false
+      properties:
+        label:
+          type: string
+          maxLength: 50
+          example: Home
+        firstName:
+          type: string
+          minLength: 1
+          maxLength: 100
+        lastName:
+          type: string
+          minLength: 1
+          maxLength: 100
+        line1:
+          type: string
+          minLength: 1
+          maxLength: 255
+        line2:
+          type: string
+          maxLength: 255
+        city:
+          type: string
+          minLength: 1
+          maxLength: 100
+        state:
+          type: string
+          minLength: 1
+          maxLength: 100
+        postalCode:
+          type: string
+          minLength: 1
+          maxLength: 20
+        country:
+          type: string
+          pattern: '^[A-Z]{2}$'
+          description: ISO 3166-1 alpha-2, upper case.
+          example: US
+        email:
+          type: string
+          format: email
+          maxLength: 255
+        phoneCountryCode:
+          type: string
+          pattern: '^\+?[0-9]{1,6}$'
+          maxLength: 8
+        phoneNumber:
+          type: string
+          pattern: '^[0-9 ()-]{4,32}$'
+          maxLength: 32
+        isDefault:
+          type: boolean
+          default: false
+
+    Address:
+      allOf:
+        - $ref: '#/components/schemas/AddressRequest'
+        - type: object
+          required: [id, isDefault]
+          properties:
+            id:
+              type: string
+              format: uuid
+            isDefault:
+              type: boolean
+            createdAt:
+              type: string
+              format: date-time
+
+    Wallet:
+      type: object
+      required: [balance, currency]
+      properties:
+        balance:
+          $ref: '#/components/schemas/Money'
+        currency:
+          type: string
+          example: USD
+
+    GiftPoints:
+      type: object
+      required: [balance, pointsPerCurrencyUnit, currencyValue, currency]
+      properties:
+        balance:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Points available.
+        pointsPerCurrencyUnit:
+          type: integer
+          minimum: 1
+          example: 100
+        currencyValue:
+          $ref: '#/components/schemas/Money'
+        currency:
+          type: string
+          example: USD
+
+    # ----- Catalog -----
+
+    Category:
+      type: object
+      required: [id, name, slug, displayOrder]
+      properties:
+        id:
+          type: string
+          format: uuid
+        parentId:
+          type: string
+          format: uuid
+          nullable: true
+        name:
+          type: string
+        slug:
+          type: string
+        displayOrder:
+          type: integer
+
+    CategoryRef:
+      type: object
+      required: [id, name, slug]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        slug:
+          type: string
+
+    Brand:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        description:
+          type: string
+          nullable: true
+
+    BrandRef:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+
+    AuthorRef:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+
+    BrandPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMetadata'
+        - type: object
+          required: [content]
+          properties:
+            content:
+              type: array
+              items:
+                $ref: '#/components/schemas/Brand'
+
+    ProductSummary:
+      type: object
+      required: [id, isbn, title, format, language, price, currency, brand, authors, coverFrontUrl, stockStatus]
+      properties:
+        id:
+          type: string
+          format: uuid
+        isbn:
+          type: string
+          example: '978-0-13-468599-1'
+        title:
+          type: string
+        tagline:
+          type: string
+          nullable: true
+        format:
+          $ref: '#/components/schemas/ProductFormat'
+        language:
+          type: string
+          example: en
+        price:
+          $ref: '#/components/schemas/Money'
+        currency:
+          type: string
+          example: USD
+        brand:
+          $ref: '#/components/schemas/BrandRef'
+        authors:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuthorRef'
+        primaryCategory:
+          allOf:
+            - $ref: '#/components/schemas/CategoryRef'
+          type: object
+          nullable: true
+        coverFrontUrl:
+          type: string
+        stockStatus:
+          $ref: '#/components/schemas/StockStatus'
+
+    ProductPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMetadata'
+        - type: object
+          required: [content]
+          properties:
+            content:
+              type: array
+              items:
+                $ref: '#/components/schemas/ProductSummary'
+
+    ProductDetail:
+      allOf:
+        - $ref: '#/components/schemas/ProductSummary'
+        - type: object
+          required: [categories, reviewCount]
+          properties:
+            description:
+              type: string
+              nullable: true
+            categories:
+              type: array
+              items:
+                $ref: '#/components/schemas/CategoryRef'
+            coverBackUrl:
+              type: string
+              nullable: true
+            weightGrams:
+              type: integer
+              nullable: true
+              description: '`null` for e-books.'
+            publicationDate:
+              type: string
+              format: date
+              nullable: true
+            averageRating:
+              type: number
+              format: double
+              minimum: 1
+              maximum: 5
+              nullable: true
+              description: '`null` when the product has no reviews.'
+            reviewCount:
+              type: integer
+              minimum: 0
+            tentativeDeliveryDate:
+              type: string
+              format: date
+              nullable: true
+              description: Today plus the estimated delivery days; see the operation description.
+            deliveryCountry:
+              type: string
+              nullable: true
+              description: Country the estimate was computed for.
+
+    RelatedProduct:
+      type: object
+      required: [relationType, product]
+      properties:
+        relationType:
+          $ref: '#/components/schemas/RelationType'
+        product:
+          $ref: '#/components/schemas/ProductSummary'
+
+    # ----- Cart -----
+
+    AddCartItemRequest:
+      type: object
+      required: [productId, quantity]
+      additionalProperties: false
+      properties:
+        productId:
+          type: string
+          format: uuid
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 99
+
+    UpdateCartItemRequest:
+      type: object
+      required: [quantity]
+      additionalProperties: false
+      properties:
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 99
+          description: New quantity. To remove the item use `DELETE`.
+
+    ApplyCouponRequest:
+      type: object
+      required: [code]
+      additionalProperties: false
+      properties:
+        code:
+          type: string
+          minLength: 1
+          maxLength: 50
+          description: Case-insensitive.
+
+    CartItem:
+      type: object
+      required: [id, productId, title, unitPrice, quantity, lineTotal, inStock]
+      properties:
+        id:
+          type: string
+          format: uuid
+        productId:
+          type: string
+          format: uuid
+        title:
+          type: string
+        coverFrontUrl:
+          type: string
+        unitPrice:
+          $ref: '#/components/schemas/Money'
+        quantity:
+          type: integer
+          minimum: 1
+        lineTotal:
+          $ref: '#/components/schemas/Money'
+        inStock:
+          type: boolean
+          description: '`false` when the current stock no longer covers `quantity`; checkout will then fail with `INSUFFICIENT_STOCK`.'
+
+    Cart:
+      type: object
+      required: [id, storeId, status, items, itemCount, subtotal, currency]
+      properties:
+        id:
+          type: string
+          format: uuid
+        storeId:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [ACTIVE]
+          description: Only the active cart is ever returned.
+        guestToken:
+          type: string
+          nullable: true
+          description: Present only on guest carts.
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/CartItem'
+        itemCount:
+          type: integer
+          minimum: 0
+          description: Sum of the item quantities.
+        subtotal:
+          $ref: '#/components/schemas/Money'
+        couponCode:
+          type: string
+          nullable: true
+        currency:
+          type: string
+          example: USD
+
+    # ----- Orders -----
+
+    CheckoutRequest:
+      type: object
+      required: [addressId]
+      additionalProperties: false
+      properties:
+        addressId:
+          type: string
+          format: uuid
+          description: One of the caller's saved addresses.
+        couponCode:
+          type: string
+          maxLength: 50
+          description: Overrides the coupon applied to the cart.
+
+    PlaceOrderRequest:
+      allOf:
+        - $ref: '#/components/schemas/CheckoutRequest'
+        - type: object
+          properties:
+            expectedTotal:
+              allOf:
+                - $ref: '#/components/schemas/Money'
+              description: The total the customer saw. Only a staleness guard, never used to compute amounts.
+
+    QuoteItem:
+      type: object
+      required: [productId, title, unitPrice, quantity, lineTotal, taxAmount]
+      properties:
+        productId:
+          type: string
+          format: uuid
+        title:
+          type: string
+        unitPrice:
+          $ref: '#/components/schemas/Money'
+        quantity:
+          type: integer
+        lineTotal:
+          $ref: '#/components/schemas/Money'
+        taxAmount:
+          $ref: '#/components/schemas/Money'
+        estimatedDeliveryDate:
+          type: string
+          format: date
+          nullable: true
+
+    CheckoutQuote:
+      type: object
+      required: [currency, items, subtotal, taxTotal, shippingTotal, couponDiscount, total, shippingAddress, giftPointsBalance, maxGiftPointsPayable]
+      properties:
+        currency:
+          type: string
+          example: USD
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/QuoteItem'
+        subtotal:
+          $ref: '#/components/schemas/Money'
+        taxTotal:
+          $ref: '#/components/schemas/Money'
+        shippingTotal:
+          $ref: '#/components/schemas/Money'
+        couponDiscount:
+          $ref: '#/components/schemas/Money'
+        total:
+          description: '`subtotal + taxTotal + shippingTotal - couponDiscount`.'
+          allOf:
+            - $ref: '#/components/schemas/Money'
+        couponCode:
+          type: string
+          nullable: true
+        shippingAddress:
+          $ref: '#/components/schemas/Address'
+        estimatedDeliveryDate:
+          type: string
+          format: date
+          nullable: true
+          description: The latest estimated delivery date among the items; `null` for e-book-only orders.
+        giftPointsBalance:
+          type: integer
+          format: int64
+          description: Points the user owns.
+        maxGiftPointsPayable:
+          type: integer
+          format: int64
+          description: Most points that may pay this order (store policy percentage of the total, limited by the balance). Points are paid later as a payment method.
+        quotedAt:
+          type: string
+          format: date-time
+
+    ShippingAddress:
+      type: object
+      description: Address snapshot copied at placement; later edits of the saved address do not change it.
+      required: [firstName, lastName, line1, city, state, postalCode, country]
+      properties:
+        firstName:
+          type: string
+        lastName:
+          type: string
+        line1:
+          type: string
+        line2:
+          type: string
+          nullable: true
+        city:
+          type: string
+        state:
+          type: string
+        postalCode:
+          type: string
+        country:
+          type: string
+        email:
+          type: string
+          nullable: true
+        phone:
+          type: string
+          nullable: true
+
+    OrderItem:
+      type: object
+      description: Snapshot of the product at purchase time.
+      required: [id, productId, title, isbn, unitPrice, quantity, lineTotal, taxAmount]
+      properties:
+        id:
+          type: string
+          format: uuid
+        productId:
+          type: string
+          format: uuid
+        title:
+          type: string
+        isbn:
+          type: string
+        unitPrice:
+          $ref: '#/components/schemas/Money'
+        quantity:
+          type: integer
+        lineTotal:
+          $ref: '#/components/schemas/Money'
+        taxAmount:
+          $ref: '#/components/schemas/Money'
+        estimatedDeliveryDate:
+          type: string
+          format: date
+          nullable: true
+
+    OrderReturn:
+      type: object
+      required: [id, status, reason, requestedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [REQUESTED, APPROVED, RECEIVED, REFUNDED, REJECTED]
+        reason:
+          type: string
+        requestedAt:
+          type: string
+          format: date-time
+        resolvedAt:
+          type: string
+          format: date-time
+          nullable: true
+
+    Order:
+      type: object
+      required: [id, orderNumber, status, currency, items, subtotal, taxTotal, shippingTotal, couponDiscount, total, refundedTotal, shippingAddress, placedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        orderNumber:
+          type: string
+          description: Human-friendly confirmation number.
+          example: BW-20261021-000123
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        currency:
+          type: string
+          example: USD
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderItem'
+        subtotal:
+          $ref: '#/components/schemas/Money'
+        taxTotal:
+          $ref: '#/components/schemas/Money'
+        shippingTotal:
+          $ref: '#/components/schemas/Money'
+        couponDiscount:
+          $ref: '#/components/schemas/Money'
+        total:
+          description: Amount payable. Gift points and wallet are payment methods that settle part of this total.
+          allOf:
+            - $ref: '#/components/schemas/Money'
+        refundedTotal:
+          description: Sum of completed refunds; `0.00` until the order is cancelled or returned.
+          allOf:
+            - $ref: '#/components/schemas/Money'
+        couponCode:
+          type: string
+          nullable: true
+        shippingAddress:
+          $ref: '#/components/schemas/ShippingAddress'
+        placedAt:
+          type: string
+          format: date-time
+        paymentExpiresAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Set while `PENDING_PAYMENT`.
+        confirmedAt:
+          type: string
+          format: date-time
+          nullable: true
+        cancelDeadlineAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Frozen at confirmation. The order can be cancelled until this instant.
+        cancelledAt:
+          type: string
+          format: date-time
+          nullable: true
+        cancellationReason:
+          type: string
+          nullable: true
+        deliveredAt:
+          type: string
+          format: date-time
+          nullable: true
+        returnDeadlineAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Frozen at delivery. A return can be requested until this instant.
+        returnRequest:
+          allOf:
+            - $ref: '#/components/schemas/OrderReturn'
+          type: object
+          nullable: true
+
+    OrderSummary:
+      type: object
+      required: [id, orderNumber, status, total, currency, placedAt, itemCount]
+      properties:
+        id:
+          type: string
+          format: uuid
+        orderNumber:
+          type: string
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        total:
+          $ref: '#/components/schemas/Money'
+        currency:
+          type: string
+        placedAt:
+          type: string
+          format: date-time
+        itemCount:
+          type: integer
+          description: Sum of the item quantities.
+        cancelDeadlineAt:
+          type: string
+          format: date-time
+          nullable: true
+
+    OrderSummaryPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMetadata'
+        - type: object
+          required: [content]
+          properties:
+            content:
+              type: array
+              items:
+                $ref: '#/components/schemas/OrderSummary'
+
+    CancelOrderRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+          maxLength: 500
+
+    ReturnOrderRequest:
+      type: object
+      required: [reason]
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 500
+
+    BuyAgainLine:
+      type: object
+      required: [productId, title, requestedQuantity, addedQuantity, outcome]
+      properties:
+        productId:
+          type: string
+          format: uuid
+        title:
+          type: string
+        requestedQuantity:
+          type: integer
+          description: Quantity in the original order.
+        addedQuantity:
+          type: integer
+          minimum: 0
+          description: Quantity actually added to the cart.
+        outcome:
+          type: string
+          enum: [ADDED, ADJUSTED, SKIPPED]
+        reason:
+          type: string
+          nullable: true
+          enum: [OUT_OF_STOCK, PRODUCT_ARCHIVED, PRODUCT_NOT_VISIBLE]
+          description: Present when the outcome is `ADJUSTED` (`OUT_OF_STOCK` for the missing part) or `SKIPPED`.
+        previousUnitPrice:
+          $ref: '#/components/schemas/Money'
+        currentUnitPrice:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          type: string
+          nullable: true
+          description: '`null` when the line was skipped.'
+
+    BuyAgainResult:
+      type: object
+      required: [lines, cart]
+      properties:
+        lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/BuyAgainLine'
+        cart:
+          $ref: '#/components/schemas/Cart'
+
+    # ----- Errors -----
+
+    ErrorCode:
+      type: string
+      description: Stable machine-readable code. Clients branch on this, never on `title` or `detail`.
+      enum:
+        - VALIDATION_FAILED
+        - MALFORMED_REQUEST
+        - UNAUTHENTICATED
+        - INVALID_CREDENTIALS
+        - ACCOUNT_DISABLED
+        - FORBIDDEN
+        - EMAIL_ALREADY_REGISTERED
+        - ADDRESS_NOT_FOUND
+        - PRODUCT_NOT_FOUND
+        - STORE_NOT_FOUND
+        - CART_NOT_FOUND
+        - CART_ITEM_NOT_FOUND
+        - ORDER_NOT_FOUND
+        - CART_EMPTY
+        - COUPON_INVALID
+        - PRODUCT_UNAVAILABLE
+        - INSUFFICIENT_STOCK
+        - PRICE_CHANGED
+        - SHIPPING_UNAVAILABLE
+        - IDEMPOTENCY_KEY_REQUIRED
+        - IDEMPOTENCY_KEY_REUSED
+        - ORDER_INVALID_STATE
+        - CANCELLATION_WINDOW_EXPIRED
+        - RETURN_WINDOW_EXPIRED
+        - CONCURRENT_MODIFICATION
+        - INTERNAL_ERROR
+
+    FieldError:
+      type: object
+      required: [field, message]
+      properties:
+        field:
+          type: string
+          example: quantity
+        message:
+          type: string
+          example: must be greater than or equal to 1
+
+    Problem:
+      type: object
+      description: RFC 7807 problem details with a stable `code`.
+      required: [type, title, status, code]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          example: 'https://bookstore.example/problems/cancellation-window-expired'
+        title:
+          type: string
+          example: Cancellation window expired
+        status:
+          type: integer
+          example: 422
+        detail:
+          type: string
+          example: The order can no longer be cancelled; the window closed at 2026-10-23T12:00:00Z.
+        instance:
+          type: string
+          description: Request path.
+          example: /api/v1/orders/6f1c3f0e-2b2a-4f43-9a52-1f0b0d8f5a11/cancel
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        requestId:
+          type: string
+          description: Same value as the `X-Request-Id` response header; quote it when reporting a problem.
+        errors:
+          type: array
+          description: Field-level errors for `VALIDATION_FAILED`.
+          items:
+            $ref: '#/components/schemas/FieldError'
+        currentTotal:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          description: Only for `PRICE_CHANGED`. The total the server computes now.

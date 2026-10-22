@@ -14,7 +14,7 @@ description: Use when the user wants to implement, modify or test the cart-to-or
    - only authenticated `CUSTOMER` users; guests are rejected (401/403). A guest cart merges into the user cart on login;
    - validate address, stock and current prices on the server; recompute items, shipping (shipping domain service) and discounts (coupon, gift points);
    - require an `Idempotency-Key` on order placement and payment.
-4. Payment via the gateway abstraction (mock implementation only). Support card (mock), wallet, gift points or a combination. Gift points convert at the configurable rate (default 100 points = 1 USD). Never store card data.
+4. Payment via the `PaymentGateway` abstraction (mock implementation only: approves by default, declines test card `4000000000000002`, returns a fake reference). Orders become `CONFIRMED` only through a real `POST /payments` call; never add a dev-only endpoint or helper to confirm orders. Cancellation tests use an injectable `Clock` (47h succeeds, 49h returns `CANCELLATION_WINDOW_EXPIRED`). Support card (mock), wallet, gift points or a combination. Gift points convert at the configurable rate (default 100 points = 1 USD). Never store card data.
 5. Confirmation: on successful payment set `CONFIRMED`, generate a confirmation number, create the shipment through the shipping service interface.
 6. Cancel: allowed only within the window from the store policy (default 48h) measured from confirmation, using an injectable `Clock`. Outside the window return 409 or 422 with a clear error code. Cancelling triggers a refund.
 7. Return (after `DELIVERED`): create a return shipment and a refund.

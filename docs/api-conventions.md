@@ -16,4 +16,7 @@ Decisions that apply to every endpoint in [`api/openapi.yaml`](../api/openapi.ya
 | Status codes | 201 on create, 204 on delete and logout, 400 malformed or invalid input, 401 not authenticated, 403 authenticated but wrong role, 404 not found (also used for resources owned by another user), 409 state or concurrency conflict, 422 request is well formed but violates a business rule. |
 | Authentication | `Authorization: Bearer <JWT>`. Guests identify their cart with the `X-Guest-Token` header. |
 | Roles | Every operation lists the roles allowed to call it in `x-required-role` (any of). `GUEST` means no authentication is required. |
-| Idempotency | `Idempotency-Key` header on order placement (and later on payments). Replaying the same key and payload returns the original result. |
+| Idempotency | `Idempotency-Key` header is required on order placement (`POST /orders`), payment (`POST /payments`) and manual refund (`POST /payments/{id}/refund`). Replaying the same key and payload returns the original result with `200` and `Idempotent-Replayed: true`; the same key with a different payload is `409 IDEMPOTENCY_KEY_REUSED`. |
+| Card data | `number`, `cvv`, `expiryMonth`, `expiryYear` are write-only (`writeOnly: true`): never persisted, logged, echoed or placed in an error message. Responses expose only `cardBrand` and `cardLast4`. Mock gateway test cards: `4242424242424242` approves, `4000000000000002` declines (`422 PAYMENT_DECLINED`). |
+| Gift points | Default 100 points = 1.00 USD (`pointsPerCurrencyUnit`), converted down to the cent. |
+| Admin operations | Refunds, shipment status changes and return-shipment creation require `ADMIN` (`x-required-role: [ADMIN]`). |

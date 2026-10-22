@@ -16,7 +16,9 @@ Books are served from our own API and PostgreSQL. The application never calls an
 5. The seed must create:
    - one store "Main Store" with a default catalog and default store policies (cancellation window 48h);
    - categories, brands and the 30 to 50 books with stock;
-   - two dev users: one `ADMIN`, one `CUSTOMER`, each with an address, a wallet balance and gift points.
+   - two dev users: one `ADMIN`, one `CUSTOMER`, each with an address, a wallet balance and gift points;
+   - shipping rates for the default country and the free-shipping threshold in the store policy;
+   - two sample orders for the `CUSTOMER`, for manual testing of the cancellation window: one `CONFIRMED` **49 hours before the seed is applied** (cancel must return `422 CANCELLATION_WINDOW_EXPIRED`) and one recent `CONFIRMED` order (cancel must succeed). Each has its order items, a `CAPTURED` payment (mock card: brand and last four digits only), the status history and an outbound shipment in `CREATED`. Compute the timestamps relative to `now()` in the SQL, with `cancel_deadline_at = confirmed_at + 48h`, so the window is correct whenever the database is created.
 6. Use UUID primary keys (fixed UUIDs for reproducibility), `NUMERIC(12,2)` money, and BCrypt-hashed passwords only. Never store plain-text passwords.
 7. Document the dev credentials in the README, marked "for local development only". Do not put real or reusable credentials anywhere.
 8. Verify with Testcontainers: the app starts under the `local` profile with the seed, and does not load it under a production profile.

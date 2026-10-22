@@ -6,7 +6,7 @@ This file provides guidance to agents when working with code in this repository.
 Backend of an online bookstore e-commerce platform (browse, cart, checkout, pay, ship, cancel/return), built with IBM Bob. A React + Carbon UI consumes the REST API and is secondary. Functional domains and flow are in [`docs/architecture.png`](docs/architecture.png): Member, Store, Catalog, Order, Payment, Shipping.
 
 ## State of the repo
-- `backend/` holds the Spring Boot 3.5 skeleton (no business endpoints yet), the Flyway `V1__initial_schema.sql` built from [`docs/data-model.md`](docs/data-model.md) and the `Containerfile`. `api/openapi.yaml` and `frontend/` do not exist yet. `requirements.md` is the source of truth: do not edit it unless asked. Items tagged **[ASSUMPTION]** are binding.
+- `backend/` holds the Spring Boot 3.5 skeleton (no business endpoints yet), the Flyway `V1__initial_schema.sql` built from [`docs/data-model.md`](docs/data-model.md) and the `Containerfile`. [`api/openapi.yaml`](api/openapi.yaml) (all six domains, conventions in [`docs/api-conventions.md`](docs/api-conventions.md)) is the contract; `frontend/` does not exist yet. Orders are confirmed only through a real `POST /payments` call: never add a dev-only confirmation helper. Work on `feature/api-implementation`, commit after each step, never push to `main`; the Pull Request is opened at the end. `requirements.md` is the source of truth: do not edit it unless asked. Items tagged **[ASSUMPTION]** are binding.
 - Everything (code, comments, identifiers, API docs, commits, seed data, docs) MUST be in English.
 
 ## Agent configuration map

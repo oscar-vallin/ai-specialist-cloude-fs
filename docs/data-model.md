@@ -395,9 +395,9 @@ erDiagram
 
 | From | To | Condition |
 |---|---|---|
-| `PENDING_PAYMENT` | `CONFIRMED` | Captured payments equal `total`. Cart becomes `CONVERTED`. `cancel_deadline_at` is set. |
+| `PENDING_PAYMENT` | `CONFIRMED` | Triggered by `POST /payments`. Captured payments equal `total`. Cart becomes `CONVERTED`. `cancel_deadline_at` is set. The outbound shipment is created. |
 | `PENDING_PAYMENT` | `PAYMENT_FAILED` | A payment failed or `payment_expires_at` passed. Terminal. The cart stays `ACTIVE`, so the customer retries by checking out again, which creates a new order. |
-| `CONFIRMED` | `SHIPPED` / `DELIVERED` | Driven by the outbound shipment. `DELIVERED` sets `delivered_at` and `return_deadline_at`. |
+| `CONFIRMED` | `SHIPPED` / `DELIVERED` | Driven by the outbound shipment (`PATCH /shipments/{id}`, admin). `DELIVERED` sets `delivered_at` and `return_deadline_at`. |
 | `CONFIRMED` | `CANCELLED` | `now() <= cancel_deadline_at`, otherwise rejected (409 or 422). Refunds every captured payment. |
 | `DELIVERED` | `RETURN_REQUESTED` | `now() <= return_deadline_at`. Creates an `order_returns` row. |
 | `RETURN_REQUESTED` | `RETURNED` | Return received. Refunds every captured payment and restocks. |
@@ -407,7 +407,7 @@ Every transition writes an `order_status_history` row. The time check uses an in
 ### 6.2 Money and points
 
 1. `orders.total = subtotal + tax_total + shipping_total - coupon_discount`.
-2. `SUM(order_items.line_total) = subtotal` and `SUM(order_items.tax_amount) = tax_total`. Tax is computed as `tax_rate * (subtotal - coupon_discount)` and allocated proportionally to lines. Shipping is not taxed. *(Modeling assumption, not stated in requirements.md.)*
+2. `SUM(order_items.line_total) = subtotal` and `SUM(order_items.tax_amount) = tax_total`. Tax is computed as `tax_rate * (subtotal - coupon_discount)` (the **discounted subtotal**), rounded half-up to the cent, and allocated proportionally to lines (the rounding remainder goes to the last line). **Shipping is not taxed.** *(Not stated in requirements.md; approved by the project owner and binding. A change must update this rule, the checkout code and the tests together.)*
 3. When an order is `CONFIRMED`, `SUM(payments.amount WHERE status = CAPTURED) = total`.
 4. For `GIFT_POINTS`: `amount = points_used / gift_points_per_currency_unit`, and `amount <= total * max_gift_points_percent / 100`. Rounding is always down to the cent.
 5. Per payment, `SUM(refunds.amount) <= payments.amount`. A cancellation or return refunds every captured payment in full.
@@ -528,4 +528,8 @@ Differences to keep in mind:
 9. **Logout needs a deny-list.** JWTs are stateless, so a logout that really invalidates the token needs `revoked_tokens`. Rows are only kept until the token expires.
 10. **Whole-order returns only.** FR-O6 returns "an order", so `order_returns` has no item rows. Partial returns would need `order_return_items` and per-line refunds.
 11. **`UPI` was removed** to follow FR-P2 and the USD decision. It can be added back as a payment method if requirements change.
-12. **Tax base** (discounted subtotal, shipping untaxed) is my assumption because requirements.md does not mention tax. It is isolated in section 6.2, rule 2, so it is easy to change.
+12. **Tax base** (discounted subtotal, shipping untaxed) is an assumption because requirements.md does not mention tax; it was **approved by the project owner**. It is isolated in section 6.2, rule 2, so it is easy to change.
+13. **Payment is one request with legs.** `POST /payments` takes the legs of one order (card, wallet, gift points) and creates one `payments` row per leg under the same idempotency key. The legs must add up to `orders.total` and are all-or-nothing, so an order is never half paid. A declined card records a `FAILED` payment (separate transaction, so the record survives the rollback of the wallet and points legs) and moves the order to `PAYMENT_FAILED`.
+14. **Mock gateway.** `PaymentGateway` is an interface; `MockPaymentGateway` approves every Luhn-valid, non-expired card, declines the test card `4000000000000002` and returns a fake `mock_ch_...` reference. Only `card_brand` (derived from the number prefix) and `card_last4` are persisted; number, CVV and expiry exist only inside the request and are never logged.
+15. **Shipments drive the order after confirmation.** Confirmation creates the `OUTBOUND` shipment (`CREATED`). An admin `PATCH /shipments/{id}` moves it to `IN_TRANSIT` (order `SHIPPED`) and `DELIVERED` (order `DELIVERED`, `return_deadline_at` set). Cancelling an order marks its outbound shipment `FAILED`. A return needs an admin to approve it (`POST /shipments/{id}/return`, creating the `RETURN` shipment); receiving it refunds all captured payments and ends the order as `RETURNED`.
+16. **Time is injected.** All lifecycle deadlines (`payment_expires_at`, `cancel_deadline_at`, `return_deadline_at`) are computed and checked with an injectable `java.time.Clock`, so tests prove that a cancel at 47 hours succeeds and at 49 hours returns `CANCELLATION_WINDOW_EXPIRED`.

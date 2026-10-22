@@ -3,16 +3,22 @@ info:
   title: Bookstore API
   version: 1.0.0
   description: |
-    Contract for the Member, Catalog, Cart and Order domains of the online bookstore backend.
+    Contract for the Member, Catalog, Cart, Order, Payment and Shipping domains of the online bookstore backend.
 
     This file is the source of truth (contract-first): code must match it, and it is reviewed before any
     endpoint is implemented. Cross-cutting conventions (camelCase JSON, money as string, pagination, error
     format, status codes) are recorded in `docs/api-conventions.md`.
 
-    **Out of this contract** (separate iterations): Payment endpoints, Shipping endpoints, Store administration
-    and Admin CRUD of catalog data. Order confirmation (`PENDING_PAYMENT -> CONFIRMED`) and shipment progress
-    (`CONFIRMED -> SHIPPED -> DELIVERED`) are driven by the Payment and Shipping domains through service
-    interfaces; they cannot be triggered through this API.
+    **Order lifecycle is driven by real calls.** An order is created `PENDING_PAYMENT` by `POST /orders`, becomes
+    `CONFIRMED` through `POST /payments`, `SHIPPED` and `DELIVERED` through `PATCH /shipments/{shipmentId}`
+    (administrators), and `RETURNED` when the return shipment is received. There is no test-only endpoint.
+
+    **Out of this contract** (separate iterations): Store administration and Admin CRUD of catalog data, wallet
+    top-ups.
+
+    **Payment safety.** Card data (number, CVV, expiry) is write-only, is never persisted or logged, and only the
+    brand and the last four digits are kept. Card payments go through a `PaymentGateway` abstraction; the deployed
+    implementation is a mock (see `POST /payments`).
 
     **Roles.** Each operation lists the roles allowed to call it in `x-required-role` (any of them).
     `GUEST` means an unauthenticated caller. A registered user has the role `CUSTOMER` or `ADMIN`; the role
@@ -39,6 +45,10 @@ tags:
     description: Shopping cart for guests and registered users.
   - name: Orders
     description: Checkout, order placement, history, cancellation, return and buy again.
+  - name: Payments
+    description: Pay an order with card (mock gateway), wallet, gift points or a combination; payments and refunds.
+  - name: Shipping
+    description: Shipping rates, delivery estimates, shipment tracking and return shipments.
 
 paths:
   /auth/register:
@@ -980,7 +990,8 @@ paths:
         Allowed only for an order in status `CONFIRMED` and only while `now <= cancelDeadlineAt`, where the deadline
         was frozen at confirmation as `confirmedAt + cancellation window` of the store policy (default 48 hours).
         The check uses the server clock. On success the status becomes `CANCELLED`, reserved/sold stock is returned
-        and every captured payment is refunded to its original method (gift points and wallet are credited back).
+        and every captured payment is refunded to its original method (gift points and wallet are credited back). The
+        outbound shipment, if any, is closed as `FAILED`.
 
         - Cancelling at 47 hours succeeds.
         - Cancelling after the window is rejected with **422** `CANCELLATION_WINDOW_EXPIRED`; nothing changes.
@@ -1088,6 +1099,445 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  # ===== Payment =====
+
+  /payments:
+    post:
+      tags: [Payments]
+      operationId: payOrder
+      summary: Pay an order (card, wallet, gift points or a combination)
+      description: |
+        Pays an order that is `PENDING_PAYMENT` through one request made of one or more **legs** (FR-P2). A leg is a
+        payment method with its share of the order total:
+
+        - `CREDIT_CARD` or `DEBIT_CARD` (at most one of the two): sent to the `PaymentGateway`. The deployed gateway
+          is a **mock**: it approves every well-formed card and declines the documented test card
+          `4000000000000002`. Test card for an approval: `4242424242424242`. The card must pass the Luhn check and must
+          not be expired. `amount` may be omitted on the card leg, meaning "the remaining balance after the other
+          legs".
+        - `WALLET`: debits `amount` from the caller's wallet.
+        - `GIFT_POINTS`: redeems `points`; the currency value is `points / pointsPerCurrencyUnit` (default 100 points
+          = 1.00 USD, FR-P5, rounded down to the cent) and may not exceed the store policy percentage of the order total.
+
+        The legs must add up to **exactly** the order `total`. All legs succeed or none does: a wallet debit or points
+        redemption is rolled back if the card is declined.
+
+        **Card data is never stored or logged.** `number`, `cvv`, `expiryMonth` and `expiryYear` exist only for the
+        duration of the request (they are write-only and never appear in a response, log line, error message or
+        database row). Only `cardBrand` and `cardLast4` are kept.
+
+        **Success.** Every captured payment is recorded and the order moves `PENDING_PAYMENT -> CONFIRMED` in the same
+        transaction (FR-P3): `confirmedAt` is set, `cancelDeadlineAt` is frozen as `confirmedAt` plus the store policy
+        cancellation window (default 48 hours), the reserved stock becomes sold, the cart becomes `CONVERTED` and an
+        outbound shipment is created (none for e-book-only orders).
+
+        **Decline.** The failed payment is recorded, nothing else is charged and the order moves to the terminal
+        status `PAYMENT_FAILED` (its stock is released). The response is `422 PAYMENT_DECLINED`. To try again the
+        customer checks out again, which creates a new order. The same happens when `paymentExpiresAt` has passed
+        (`422 PAYMENT_WINDOW_EXPIRED`).
+
+        **Idempotency.** `Idempotency-Key` is required. Replaying a key with the same body returns the original
+        result with `200` and the header `Idempotent-Replayed: true`, without charging again. Reusing it with a
+        different body returns `IDEMPOTENCY_KEY_REUSED` (409).
+
+        Error codes: `IDEMPOTENCY_KEY_REQUIRED` (400), `VALIDATION_FAILED` (400), `UNAUTHENTICATED` (401),
+        `ORDER_NOT_FOUND` (404), `ORDER_INVALID_STATE` (409; the order is not `PENDING_PAYMENT`),
+        `IDEMPOTENCY_KEY_REUSED` (409), `PAYMENT_AMOUNT_MISMATCH` (422), `INSUFFICIENT_WALLET_BALANCE` (422),
+        `INSUFFICIENT_GIFT_POINTS` (422), `GIFT_POINTS_LIMIT_EXCEEDED` (422), `PAYMENT_DECLINED` (422),
+        `PAYMENT_WINDOW_EXPIRED` (422), `CONCURRENT_MODIFICATION` (409).
+      x-required-role: [CUSTOMER]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PayOrderRequest'
+            examples:
+              cardOnly:
+                summary: Whole order on a card
+                value:
+                  orderId: 3f2b8c1e-5a77-4f3e-9d0a-0e6f3a2b1c90
+                  legs:
+                    - method: CREDIT_CARD
+                      card:
+                        number: '4242424242424242'
+                        expiryMonth: 12
+                        expiryYear: 2030
+                        cvv: '123'
+              pointsWalletCard:
+                summary: 500 points + 5.00 from the wallet + the rest on a card
+                value:
+                  orderId: 3f2b8c1e-5a77-4f3e-9d0a-0e6f3a2b1c90
+                  legs:
+                    - method: GIFT_POINTS
+                      points: 500
+                    - method: WALLET
+                      amount: '5.00'
+                    - method: DEBIT_CARD
+                      card:
+                        number: '4242424242424242'
+                        expiryMonth: 12
+                        expiryYear: 2030
+                        cvv: '123'
+      responses:
+        '201':
+          description: Payment captured and order confirmed.
+          headers:
+            Location:
+              description: URL of the order.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentResult'
+        '200':
+          description: Idempotent replay; the original result.
+          headers:
+            Idempotent-Replayed:
+              description: Always `true`.
+              schema:
+                type: string
+                enum: ['true']
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /payments/{paymentId}:
+    parameters:
+      - $ref: '#/components/parameters/PaymentId'
+    get:
+      tags: [Payments]
+      operationId: getPayment
+      summary: Get one payment with its refunds
+      description: |
+        A `CUSTOMER` can read the payments of their own orders (another user's payment is reported as not found).
+        An `ADMIN` can read any payment. Card data is never returned except `cardBrand` and `cardLast4`.
+
+        Error codes: `PAYMENT_NOT_FOUND` (404).
+      x-required-role: [CUSTOMER, ADMIN]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The payment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payment'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /payments/{paymentId}/refund:
+    parameters:
+      - $ref: '#/components/parameters/PaymentId'
+    post:
+      tags: [Payments]
+      operationId: refundPayment
+      summary: Refund a payment, fully or partially (administrators)
+      description: |
+        Manual refund by an administrator (for example goodwill or a dispute). The money goes back to the **original
+        method** of the payment (FR-P4): a card refund is sent to the gateway, a wallet refund is credited to the
+        wallet and a gift point refund is credited as points (`amount x pointsPerCurrencyUnit`, rounded down).
+
+        Refunds caused by a cancellation or a completed return are created automatically by the system (always the
+        full captured amount) and appear in `Payment.refunds`; they do not use this endpoint.
+
+        A refund does not change the order status. The payment must be `CAPTURED` or `PARTIALLY_REFUNDED`, and the
+        sum of its refunds may never exceed `Payment.amount`. When the sum reaches the amount the payment becomes
+        `REFUNDED`, otherwise `PARTIALLY_REFUNDED`. `Idempotency-Key` is required; a replay returns the original
+        refund with `200` and `Idempotent-Replayed: true`.
+
+        Error codes: `IDEMPOTENCY_KEY_REQUIRED` (400), `VALIDATION_FAILED` (400), `UNAUTHENTICATED` (401),
+        `FORBIDDEN` (403), `PAYMENT_NOT_FOUND` (404), `PAYMENT_INVALID_STATE` (409),
+        `IDEMPOTENCY_KEY_REUSED` (409), `REFUND_EXCEEDS_PAYMENT` (422).
+      x-required-role: [ADMIN]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefundRequest'
+      responses:
+        '201':
+          description: Refund completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refund'
+        '200':
+          description: Idempotent replay; the original refund.
+          headers:
+            Idempotent-Replayed:
+              description: Always `true`.
+              schema:
+                type: string
+                enum: ['true']
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refund'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  # ===== Shipping =====
+
+  /shipping/rates:
+    get:
+      tags: [Shipping]
+      operationId: getShippingRate
+      summary: Shipping rate for a destination country and weight
+      description: |
+        FR-SH1. Finds the shipping rate band of the store whose weight range contains `weightGrams` (lower bound
+        inclusive, upper bound exclusive) for the destination `country`. When `orderSubtotal` is sent and reaches the
+        store policy free-shipping threshold, `rate` is `0.00` and `freeShippingApplied` is `true`; `baseRate` always
+        shows the band price. This is the same calculation checkout uses.
+
+        Error codes: `VALIDATION_FAILED` (400), `STORE_NOT_FOUND` (404), `SHIPPING_UNAVAILABLE` (422; no band for that
+        country and weight).
+      x-required-role: [GUEST, CUSTOMER, ADMIN]
+      security:
+        - {}
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/StoreId'
+        - name: country
+          in: query
+          required: true
+          description: Destination country (ISO 3166-1 alpha-2, upper case).
+          schema:
+            type: string
+            pattern: '^[A-Z]{2}$'
+            example: US
+        - name: weightGrams
+          in: query
+          required: true
+          description: Total weight of the parcel in grams.
+          schema:
+            type: integer
+            minimum: 1
+            example: 850
+        - name: orderSubtotal
+          in: query
+          description: Order subtotal, used to apply the free-shipping threshold.
+          schema:
+            $ref: '#/components/schemas/Money'
+      responses:
+        '200':
+          description: The rate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShippingRateQuote'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /shipping/estimate:
+    get:
+      tags: [Shipping]
+      operationId: estimateDelivery
+      summary: Estimated delivery time and tentative delivery date for a product
+      description: |
+        FR-SH2. The destination is, in order: `addressId` (one of the caller's addresses; needs a bearer token), or
+        `country`, or the country of the caller's default address, or the store's default country. `addressId` and
+        `country` together are rejected. The date is the server date (UTC) plus `estimatedDaysMax` of the shipping
+        rate band that matches the product weight. E-books and destinations without a rate are not shippable:
+        `shippable` is `false` and the days and the date are `null`.
+
+        Error codes: `VALIDATION_FAILED` (400), `UNAUTHENTICATED` (401; `addressId` without a token),
+        `ADDRESS_NOT_FOUND` (404), `PRODUCT_NOT_FOUND` (404; also when the product is not visible to the caller),
+        `STORE_NOT_FOUND` (404).
+      x-required-role: [GUEST, CUSTOMER, ADMIN]
+      security:
+        - {}
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/StoreId'
+        - name: productId
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: addressId
+          in: query
+          description: One of the caller's saved addresses.
+          schema:
+            type: string
+            format: uuid
+        - name: country
+          in: query
+          description: Destination country (ISO 3166-1 alpha-2, upper case).
+          schema:
+            type: string
+            pattern: '^[A-Z]{2}$'
+            example: US
+      responses:
+        '200':
+          description: The estimate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeliveryEstimate'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /shipments/{shipmentId}:
+    parameters:
+      - $ref: '#/components/parameters/ShipmentId'
+    get:
+      tags: [Shipping]
+      operationId: getShipment
+      summary: Get a shipment (tracking)
+      description: |
+        FR-SH3. A `CUSTOMER` can read the shipments of their own orders (another user's shipment is reported as not
+        found); an `ADMIN` can read any. The ids of an order's shipments are in `Order.shipments`.
+
+        Error codes: `SHIPMENT_NOT_FOUND` (404).
+      x-required-role: [CUSTOMER, ADMIN]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The shipment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Shipment'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Shipping]
+      operationId: updateShipmentStatus
+      summary: Record a carrier event on a shipment (administrators)
+      description: |
+        Advances a shipment. This is how an order reaches `SHIPPED` and `DELIVERED` (and how a return is received);
+        a real carrier integration would call the same service. Allowed transitions:
+
+        | Shipment | From | To | Effect |
+        |---|---|---|---|
+        | `OUTBOUND` | `CREATED` | `IN_TRANSIT` | `carrier` and `trackingNumber` are required. Sets `shippedAt`. Order `CONFIRMED -> SHIPPED`. |
+        | `OUTBOUND` | `IN_TRANSIT` | `DELIVERED` | Sets `deliveredAt`. Order `SHIPPED -> DELIVERED`; `returnDeadlineAt` is frozen as `deliveredAt` plus the store policy return window (default 7 days). |
+        | `OUTBOUND` | `CREATED`, `IN_TRANSIT` | `FAILED` | Delivery failed. The order status does not change. |
+        | `RETURN` | `CREATED` | `IN_TRANSIT` | Sets `shippedAt`. `carrier` and `trackingNumber` are optional. |
+        | `RETURN` | `IN_TRANSIT` | `DELIVERED` | The parcel is received. The return becomes `RECEIVED` and then `REFUNDED`, every captured payment of the order is refunded to its original method, stock is restocked and the order becomes `RETURNED`. |
+        | `RETURN` | `CREATED`, `IN_TRANSIT` | `FAILED` | Return parcel lost. The order stays `RETURN_REQUESTED`. |
+
+        Any other transition, and any change to a shipment already `DELIVERED` or `FAILED`, is rejected with
+        `409 SHIPMENT_INVALID_STATE`. A shipment closed because its order was cancelled is `FAILED`.
+
+        Error codes: `VALIDATION_FAILED` (400), `UNAUTHENTICATED` (401), `FORBIDDEN` (403),
+        `SHIPMENT_NOT_FOUND` (404), `SHIPMENT_INVALID_STATE` (409), `CONCURRENT_MODIFICATION` (409).
+      x-required-role: [ADMIN]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateShipmentStatusRequest'
+      responses:
+        '200':
+          description: The updated shipment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Shipment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /shipments/{shipmentId}/return:
+    parameters:
+      - $ref: '#/components/parameters/ShipmentId'
+    post:
+      tags: [Shipping]
+      operationId: createReturnShipment
+      summary: Approve a return and create its return shipment (administrators)
+      description: |
+        FR-SH3 / FR-O6. `shipmentId` is the **outbound** shipment of the order. It must be `DELIVERED`, and the order
+        must be `RETURN_REQUESTED` with a return still `REQUESTED` (see `POST /orders/{orderId}/return`) and no return
+        shipment yet. The return becomes `APPROVED` and a `RETURN` shipment is created in status `CREATED` with
+        `shippingCost` `0.00` (the store pays the return label). Its id appears in `Order.shipments`. The customer
+        then sends the parcel back; when an administrator records its delivery (`PATCH /shipments/{shipmentId}`) the
+        refund is issued and the order becomes `RETURNED`.
+
+        Error codes: `UNAUTHENTICATED` (401), `FORBIDDEN` (403), `SHIPMENT_NOT_FOUND` (404),
+        `SHIPMENT_INVALID_STATE` (409; not an outbound shipment, not delivered, no pending return request or a return
+        shipment already exists).
+      x-required-role: [ADMIN]
+      security:
+        - bearerAuth: []
+      responses:
+        '201':
+          description: Return shipment created.
+          headers:
+            Location:
+              description: URL of the return shipment.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Shipment'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1177,6 +1627,20 @@ components:
       schema:
         type: string
         format: uuid
+    PaymentId:
+      name: paymentId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ShipmentId:
+      name: shipmentId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
 
   responses:
     BadRequest:
@@ -1204,13 +1668,13 @@ components:
           schema:
             $ref: '#/components/schemas/Problem'
     Conflict:
-      description: The request conflicts with the current state (`EMAIL_ALREADY_REGISTERED`, `INSUFFICIENT_STOCK`, `PRICE_CHANGED`, `IDEMPOTENCY_KEY_REUSED`, `ORDER_INVALID_STATE`, `CONCURRENT_MODIFICATION`).
+      description: The request conflicts with the current state (`EMAIL_ALREADY_REGISTERED`, `INSUFFICIENT_STOCK`, `PRICE_CHANGED`, `IDEMPOTENCY_KEY_REUSED`, `ORDER_INVALID_STATE`, `PAYMENT_INVALID_STATE`, `SHIPMENT_INVALID_STATE`, `CONCURRENT_MODIFICATION`).
       content:
         application/problem+json:
           schema:
             $ref: '#/components/schemas/Problem'
     UnprocessableEntity:
-      description: Well formed but violates a business rule (`CART_EMPTY`, `COUPON_INVALID`, `PRODUCT_UNAVAILABLE`, `SHIPPING_UNAVAILABLE`, `CANCELLATION_WINDOW_EXPIRED`, `RETURN_WINDOW_EXPIRED`).
+      description: Well formed but violates a business rule (`CART_EMPTY`, `COUPON_INVALID`, `PRODUCT_UNAVAILABLE`, `SHIPPING_UNAVAILABLE`, `CANCELLATION_WINDOW_EXPIRED`, `RETURN_WINDOW_EXPIRED`, `PAYMENT_DECLINED`, `PAYMENT_WINDOW_EXPIRED`, `PAYMENT_AMOUNT_MISMATCH`, `INSUFFICIENT_WALLET_BALANCE`, `INSUFFICIENT_GIFT_POINTS`, `GIFT_POINTS_LIMIT_EXCEEDED`, `REFUND_EXCEEDS_PAYMENT`).
       content:
         application/problem+json:
           schema:
@@ -1926,7 +2390,7 @@ components:
 
     Order:
       type: object
-      required: [id, orderNumber, status, currency, items, subtotal, taxTotal, shippingTotal, couponDiscount, total, refundedTotal, shippingAddress, placedAt]
+      required: [id, orderNumber, status, currency, items, subtotal, taxTotal, shippingTotal, couponDiscount, total, refundedTotal, shippingAddress, placedAt, paymentIds, shipments]
       properties:
         id:
           type: string
@@ -2003,6 +2467,17 @@ components:
             - $ref: '#/components/schemas/OrderReturn'
           type: object
           nullable: true
+        paymentIds:
+          type: array
+          description: Ids of the payments of this order (`GET /payments/{paymentId}`). Empty until a payment is attempted.
+          items:
+            type: string
+            format: uuid
+        shipments:
+          type: array
+          description: Outbound shipment and, when a return was approved, the return shipment (`GET /shipments/{shipmentId}`).
+          items:
+            $ref: '#/components/schemas/ShipmentRef'
 
     OrderSummary:
       type: object
@@ -2103,6 +2578,343 @@ components:
         cart:
           $ref: '#/components/schemas/Cart'
 
+    # ----- Payments -----
+
+    PaymentMethod:
+      type: string
+      enum: [CREDIT_CARD, DEBIT_CARD, WALLET, GIFT_POINTS]
+
+    PaymentStatus:
+      type: string
+      enum: [PENDING, AUTHORIZED, CAPTURED, FAILED, REFUNDED, PARTIALLY_REFUNDED]
+
+    CardDetails:
+      type: object
+      description: |
+        Card data for the mock gateway. **Write-only**: it is never stored, logged, echoed back or put in an error
+        message. Only the brand and the last four digits survive the request.
+      required: [number, expiryMonth, expiryYear, cvv]
+      additionalProperties: false
+      properties:
+        number:
+          type: string
+          pattern: '^\d{13,19}$'
+          writeOnly: true
+          description: Card number, digits only, Luhn-valid. `4242424242424242` is approved; `4000000000000002` is declined by the mock gateway.
+          example: '4242424242424242'
+        expiryMonth:
+          type: integer
+          minimum: 1
+          maximum: 12
+          writeOnly: true
+        expiryYear:
+          type: integer
+          minimum: 2000
+          maximum: 2100
+          writeOnly: true
+          description: Four-digit year. The card must not be expired.
+        cvv:
+          type: string
+          pattern: '^\d{3,4}$'
+          writeOnly: true
+
+    PaymentLeg:
+      type: object
+      description: |
+        One payment method and its share of the order total. Required fields by `method`:
+
+        | method | required | forbidden |
+        |---|---|---|
+        | `CREDIT_CARD`, `DEBIT_CARD` | `card` (`amount` optional: the remainder) | `points` |
+        | `WALLET` | `amount` | `card`, `points` |
+        | `GIFT_POINTS` | `points` | `card`, `amount` (it is derived from `points`) |
+      required: [method]
+      additionalProperties: false
+      properties:
+        method:
+          $ref: '#/components/schemas/PaymentMethod'
+        amount:
+          $ref: '#/components/schemas/Money'
+        points:
+          type: integer
+          format: int64
+          minimum: 1
+        card:
+          $ref: '#/components/schemas/CardDetails'
+
+    PayOrderRequest:
+      type: object
+      required: [orderId, legs]
+      additionalProperties: false
+      properties:
+        orderId:
+          type: string
+          format: uuid
+          description: One of the caller's orders, in status `PENDING_PAYMENT`.
+        legs:
+          type: array
+          minItems: 1
+          maxItems: 3
+          description: At most one leg per method family (one card, one wallet, one gift points).
+          items:
+            $ref: '#/components/schemas/PaymentLeg'
+
+    Refund:
+      type: object
+      required: [id, paymentId, orderId, amount, status, reason, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        paymentId:
+          type: string
+          format: uuid
+        orderId:
+          type: string
+          format: uuid
+        returnId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Set when the refund was caused by a return.
+        amount:
+          $ref: '#/components/schemas/Money'
+        status:
+          type: string
+          enum: [PENDING, COMPLETED, FAILED]
+        reason:
+          type: string
+        refundedAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+
+    Payment:
+      type: object
+      required: [id, orderId, method, status, amount, createdAt, refunds]
+      properties:
+        id:
+          type: string
+          format: uuid
+        orderId:
+          type: string
+          format: uuid
+        method:
+          $ref: '#/components/schemas/PaymentMethod'
+        status:
+          $ref: '#/components/schemas/PaymentStatus'
+        amount:
+          description: Currency value of the leg. For `GIFT_POINTS` it is `pointsUsed / pointsPerCurrencyUnit`.
+          allOf:
+            - $ref: '#/components/schemas/Money'
+        pointsUsed:
+          type: integer
+          format: int64
+          nullable: true
+          description: Only for `GIFT_POINTS`.
+        cardBrand:
+          type: string
+          nullable: true
+          example: VISA
+          description: Only for card methods.
+        cardLast4:
+          type: string
+          nullable: true
+          pattern: '^\d{4}$'
+          example: '4242'
+          description: Only for card methods. The only part of the card number that is kept.
+        gatewayReference:
+          type: string
+          nullable: true
+          example: mock_ch_8f3a1c2d9b
+          description: Fake reference returned by the mock gateway (card methods only).
+        failureReason:
+          type: string
+          nullable: true
+          description: Set when `status` is `FAILED`. Never contains card data.
+        processedAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        refunds:
+          type: array
+          items:
+            $ref: '#/components/schemas/Refund'
+
+    PaymentResult:
+      type: object
+      required: [order, payments]
+      properties:
+        order:
+          description: The order, now `CONFIRMED`.
+          allOf:
+            - $ref: '#/components/schemas/Order'
+        payments:
+          type: array
+          description: One captured payment per leg.
+          items:
+            $ref: '#/components/schemas/Payment'
+
+    RefundRequest:
+      type: object
+      required: [amount, reason]
+      additionalProperties: false
+      properties:
+        amount:
+          description: Greater than zero and not above the amount still refundable on the payment.
+          allOf:
+            - $ref: '#/components/schemas/Money'
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 500
+
+    # ----- Shipping -----
+
+    ShipmentType:
+      type: string
+      enum: [OUTBOUND, RETURN]
+
+    ShipmentStatus:
+      type: string
+      enum: [CREATED, IN_TRANSIT, DELIVERED, FAILED, RETURNED]
+
+    ShipmentRef:
+      type: object
+      required: [id, type, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          $ref: '#/components/schemas/ShipmentType'
+        status:
+          $ref: '#/components/schemas/ShipmentStatus'
+
+    Shipment:
+      type: object
+      required: [id, orderId, type, status, shippingCost, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        orderId:
+          type: string
+          format: uuid
+        type:
+          $ref: '#/components/schemas/ShipmentType'
+        returnId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Only for `RETURN` shipments.
+        status:
+          $ref: '#/components/schemas/ShipmentStatus'
+        carrier:
+          type: string
+          nullable: true
+        trackingNumber:
+          type: string
+          nullable: true
+        shippingCost:
+          $ref: '#/components/schemas/Money'
+        estimatedDeliveryDate:
+          type: string
+          format: date
+          nullable: true
+        shippedAt:
+          type: string
+          format: date-time
+          nullable: true
+        deliveredAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+
+    UpdateShipmentStatusRequest:
+      type: object
+      required: [status]
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum: [IN_TRANSIT, DELIVERED, FAILED]
+          description: The new status. See the transition table of the operation.
+        carrier:
+          type: string
+          maxLength: 100
+          description: Required when an outbound shipment goes `IN_TRANSIT`.
+        trackingNumber:
+          type: string
+          maxLength: 100
+          description: Required when an outbound shipment goes `IN_TRANSIT`.
+
+    ShippingRateQuote:
+      type: object
+      required: [country, weightGrams, currency, baseRate, rate, freeShippingApplied, estimatedDaysMin, estimatedDaysMax]
+      properties:
+        country:
+          type: string
+          example: US
+        weightGrams:
+          type: integer
+        currency:
+          type: string
+          example: USD
+        baseRate:
+          description: Price of the matching weight band.
+          allOf:
+            - $ref: '#/components/schemas/Money'
+        rate:
+          description: Price to charge; `0.00` when free shipping applies.
+          allOf:
+            - $ref: '#/components/schemas/Money'
+        freeShippingApplied:
+          type: boolean
+        freeShippingThreshold:
+          description: Store policy threshold; `null` when the store has none.
+          type: string
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Money'
+        estimatedDaysMin:
+          type: integer
+        estimatedDaysMax:
+          type: integer
+
+    DeliveryEstimate:
+      type: object
+      required: [productId, country, shippable]
+      properties:
+        productId:
+          type: string
+          format: uuid
+        country:
+          type: string
+          example: US
+        shippable:
+          type: boolean
+          description: '`false` for e-books and for destinations without a shipping rate.'
+        estimatedDaysMin:
+          type: integer
+          nullable: true
+        estimatedDaysMax:
+          type: integer
+          nullable: true
+        tentativeDeliveryDate:
+          type: string
+          format: date
+          nullable: true
+
     # ----- Errors -----
 
     ErrorCode:
@@ -2133,6 +2945,17 @@ components:
         - ORDER_INVALID_STATE
         - CANCELLATION_WINDOW_EXPIRED
         - RETURN_WINDOW_EXPIRED
+        - PAYMENT_NOT_FOUND
+        - SHIPMENT_NOT_FOUND
+        - PAYMENT_DECLINED
+        - PAYMENT_WINDOW_EXPIRED
+        - PAYMENT_AMOUNT_MISMATCH
+        - INSUFFICIENT_WALLET_BALANCE
+        - INSUFFICIENT_GIFT_POINTS
+        - GIFT_POINTS_LIMIT_EXCEEDED
+        - PAYMENT_INVALID_STATE
+        - REFUND_EXCEEDS_PAYMENT
+        - SHIPMENT_INVALID_STATE
         - CONCURRENT_MODIFICATION
         - INTERNAL_ERROR
 
@@ -2183,3 +3006,7 @@ components:
           allOf:
             - $ref: '#/components/schemas/Money'
           description: Only for `PRICE_CHANGED`. The total the server computes now.
+        paymentId:
+          type: string
+          format: uuid
+          description: Only for `PAYMENT_DECLINED`. The failed payment that was recorded.

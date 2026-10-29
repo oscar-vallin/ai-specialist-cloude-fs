@@ -18,8 +18,8 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 /**
- * Smoke test against a real PostgreSQL: the application starts, Flyway applies V1 and
- * Hibernate validation passes (ddl-auto=validate), and the health endpoint is public.
+ * Smoke test against a real PostgreSQL: the application starts, Flyway applies the schema migrations
+ * (without the local seed) and the health endpoint is public.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -34,6 +34,7 @@ class BookstoreApplicationTest {
         registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
+        registry.add("app.jwt.secret", () -> "test-only-secret-test-only-secret-0123456789");
     }
 
     @Autowired
@@ -51,16 +52,18 @@ class BookstoreApplicationTest {
 
     @Test
     void protectedEndpointsReturn401WhenAnonymous() throws Exception {
-        mockMvc.perform(MockMvcRequestBuilders.get("/api/v1/products"))
-                .andExpect(MockMvcResultMatchers.status().isUnauthorized());
+        mockMvc.perform(MockMvcRequestBuilders.get("/api/v1/users/me"))
+                .andExpect(MockMvcResultMatchers.status().isUnauthorized())
+                .andExpect(MockMvcResultMatchers.jsonPath("$.code").value("UNAUTHENTICATED"));
     }
 
     @Test
-    void flywayAppliedV1() {
+    void flywayAppliedSchemaMigrations() {
+        // Schema migrations only (production profile); the local seed is V1000 and is not loaded here.
         String version = jdbc.queryForObject(
                 "SELECT version FROM flyway_schema_history WHERE success ORDER BY installed_rank DESC LIMIT 1",
                 String.class);
-        assertThat(version).isEqualTo("1");
+        assertThat(version).isEqualTo("2");
     }
 
     @Test

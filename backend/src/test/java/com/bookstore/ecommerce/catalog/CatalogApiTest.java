@@ -45,6 +45,8 @@ class CatalogApiTest extends IntegrationTest {
         mvc.perform(get("/api/v1/products").param("q", "holmes"))
                 .andExpect(jsonPath("$.content[0].title").value("The Adventures of Sherlock Holmes"));
         mvc.perform(get("/api/v1/products").param("q", "jane austen"))
+                .andExpect(jsonPath("$.totalElements").value(1));
+        mvc.perform(get("/api/v1/products").param("q", "no such book anywhere"))
                 .andExpect(jsonPath("$.totalElements").value(0));
         mvc.perform(get("/api/v1/products").param("q", "austen"))
                 .andExpect(jsonPath("$.content[0].title").value("Pride and Prejudice"));
